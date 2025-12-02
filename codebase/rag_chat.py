@@ -39,6 +39,24 @@ def connect_db():
 
 
 # ----------------------------
+# Get demo user ID
+# ----------------------------
+def get_demo_user_id():
+    """Get the demo user's ID from the database."""
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE api_key = 'demo-api-key';")
+    result = cur.fetchone()
+    cur.close()
+    pool = get_connection_pool()
+    pool.putconn(conn)
+
+    if result:
+        return result[0]
+    raise Exception("Demo user not found. Run create_index.py first.")
+
+
+# ----------------------------
 # Embed the user query
 # ----------------------------
 def embed_query(query):
@@ -56,15 +74,15 @@ def embed_query(query):
 MAX_INITIAL = 15
 MAX_CORPUS_PCT = 0.25
 
-def get_top_k(raw_query_embedding):
+def get_top_k(raw_query_embedding, user_id):
     # Convert embedding to pgvector format: [0.12,0.53,...]
     emb_str = "[" + ",".join(str(x) for x in raw_query_embedding) + "]"
 
     conn = connect_db()
     cur = conn.cursor()
 
-    # Get total chunk count for corpus-aware cap
-    cur.execute("SELECT COUNT(*) FROM chunks;")
+    # Get total chunk count for this user's corpus
+    cur.execute("SELECT COUNT(*) FROM chunks WHERE user_id = %s;", (user_id,))
     total_chunks = cur.fetchone()[0]
 
     # Cap at 25% of corpus or MAX_INITIAL, whichever is smaller
@@ -73,14 +91,16 @@ def get_top_k(raw_query_embedding):
 
     # <=> operator = cosine distance (0 = identical, 2 = opposite)
     # cosine similarity = 1 - (distance / 2) to get range [0, 1]
+    # Filter by user_id to only search this user's chunks
     cur.execute(
         f"""
         SELECT chunk, source, chunk_index, 1 - (embedding <=> %s) / 2 AS similarity
         FROM chunks
+        WHERE user_id = %s
         ORDER BY embedding <=> %s
         LIMIT {k};
         """,
-        (emb_str, emb_str)
+        (emb_str, user_id, emb_str)
     )
 
     rows = cur.fetchall()
@@ -140,15 +160,15 @@ def filter_chunks(chunks):
 # ----------------------------
 # Generate final answer using RAG
 # ----------------------------
-def ask(query):
+def ask(query, user_id):
     # 1. Embed query
     t0 = time.time()
     query_embedding = embed_query(query)
     print(f"Embedding took: {time.time() - t0:.2f}s")
 
-    # 2. Retrieve initial pool of chunks
+    # 2. Retrieve initial pool of chunks for this user
     t1 = time.time()
-    initial_chunks, total_chunks = get_top_k(query_embedding)
+    initial_chunks, total_chunks = get_top_k(query_embedding, user_id)
     print(f"DB query took: {time.time() - t1:.2f}s")
 
     # 3. Filter chunks dynamically
@@ -207,11 +227,15 @@ When you reference information from the context, cite it using the chunk number 
 
 #user input loop
 if __name__ == "__main__":
+    # Get demo user for CLI usage
+    DEMO_USER_ID = get_demo_user_id()
+
     print("RAG Chatbot Ready! Ask something about your documents.")
+    print(f"Using demo user (id={DEMO_USER_ID})")
     print("Type 'q' to exit.\n")
     while True:
         q = input("Ask: ")
         if q.lower() in ("q"):
             print("Goodbye!")
             break
-        print("\n" + ask(q))
+        print("\n" + ask(q, DEMO_USER_ID))
