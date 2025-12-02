@@ -33,6 +33,35 @@ def connect_db():
 
 
 # ----------------------------
+# Get or create demo user
+# ----------------------------
+def get_or_create_demo_user():
+    """Get the demo user's ID, creating the user if needed."""
+    conn = connect_db()
+    cur = conn.cursor()
+
+    # Try to get existing demo user
+    cur.execute("SELECT id FROM users WHERE api_key = 'demo-api-key';")
+    result = cur.fetchone()
+
+    if result:
+        user_id = result[0]
+    else:
+        # Create demo user if not exists
+        cur.execute("""
+            INSERT INTO users (name, api_key)
+            VALUES ('Demo User', 'demo-api-key')
+            RETURNING id;
+        """)
+        user_id = cur.fetchone()[0]
+        conn.commit()
+
+    cur.close()
+    conn.close()
+    return user_id
+
+
+# ----------------------------
 # Batch embed using OpenAI API
 # ----------------------------
 def embed_batch(texts):
@@ -58,7 +87,7 @@ def embed_batch(texts):
 # ----------------------------
 # Process PDF: chunk, embed, insert
 # ----------------------------
-def process_pdf(path):
+def process_pdf(path, user_id):
     # 1. Chunk the PDF
     print(f"Chunking {path}...")
     chunks = chunk_pdf(path)
@@ -71,7 +100,7 @@ def process_pdf(path):
     print(f"Embedding took: {time.time() - t0:.2f}s")
 
     # 3. Insert into database
-    print("\nInserting into database...")
+    print(f"\nInserting into database for user_id={user_id}...")
     conn = connect_db()
     cur = conn.cursor()
 
@@ -81,10 +110,10 @@ def process_pdf(path):
 
         cur.execute(
             """
-            INSERT INTO chunks (chunk, embedding, source, chunk_index)
-            VALUES (%s, %s, %s, %s);
+            INSERT INTO chunks (user_id, chunk, embedding, source, chunk_index)
+            VALUES (%s, %s, %s, %s, %s);
             """,
-            (chunk, emb_str, path, i)
+            (user_id, chunk, emb_str, path, i)
         )
 
     conn.commit()
@@ -94,4 +123,7 @@ def process_pdf(path):
 
 
 if __name__ == "__main__":
-    process_pdf(PDF_PATH)
+    # Get or create demo user for CLI usage
+    demo_user_id = get_or_create_demo_user()
+    print(f"Using demo user (id={demo_user_id})")
+    process_pdf(PDF_PATH, demo_user_id)
