@@ -6,3 +6,4 @@ PyMuPDF
 Pillow
 spacy
 pydantic
+diskcache
