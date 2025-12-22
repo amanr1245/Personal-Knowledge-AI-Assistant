@@ -115,6 +115,12 @@ def get_top_k(raw_query_embedding, user_id):
 
 
 # ----------------------------
+# Context expansion configuration
+# ----------------------------
+EXPAND_RADIUS = int(os.getenv("EXPAND_RADIUS", "1"))
+
+
+# ----------------------------
 # Filter chunks by similarity threshold and drop-off
 # ----------------------------
 MIN_SIMILARITY = 0.65
@@ -161,6 +167,71 @@ def filter_chunks(chunks):
 
 
 # ----------------------------
+# Expand context with adjacent chunks
+# ----------------------------
+def expand_context(chunks, user_id, radius=None):
+    """
+    Expand context by fetching adjacent chunks for each retrieved chunk.
+
+    For each chunk, fetches N preceding and N following chunks from the same document.
+    Deduplicates and sorts by document order.
+
+    Args:
+        chunks: List of chunk tuples (chunk, header, source, chunk_index, similarity)
+        user_id: User ID for filtering
+        radius: Number of chunks before/after to fetch (default: EXPAND_RADIUS from .env)
+
+    Returns:
+        List of expanded chunk tuples, sorted by (source, chunk_index)
+    """
+    if radius is None:
+        radius = EXPAND_RADIUS
+
+    if not chunks or radius == 0:
+        return chunks
+
+    # Use dict to deduplicate by (source, chunk_index)
+    expanded = {}
+
+    conn = connect_db()
+    cur = conn.cursor()
+
+    for chunk_tuple in chunks:
+        # Chunk tuple: (chunk, header, source, chunk_index, similarity)
+        source = chunk_tuple[2]
+        chunk_index = chunk_tuple[3]
+
+        # Fetch adjacent chunks within radius
+        cur.execute(
+            """
+            SELECT chunk, header, source, chunk_index, 0.0 AS similarity
+            FROM chunks
+            WHERE user_id = %s AND source = %s
+              AND chunk_index BETWEEN %s AND %s
+            ORDER BY chunk_index
+            """,
+            (user_id, source, chunk_index - radius, chunk_index + radius)
+        )
+
+        for row in cur.fetchall():
+            key = (row[2], row[3])  # (source, chunk_index)
+            if key not in expanded:
+                # Preserve original similarity if this was a retrieved chunk
+                original_sim = next(
+                    (c[4] for c in chunks if c[2] == row[2] and c[3] == row[3]),
+                    0.0  # Adjacent chunks get 0.0 similarity (context only)
+                )
+                expanded[key] = (row[0], row[1], row[2], row[3], original_sim)
+
+    cur.close()
+    pool = get_connection_pool()
+    pool.putconn(conn)
+
+    # Sort by source, then chunk_index for coherent reading order
+    return sorted(expanded.values(), key=lambda c: (c[2], c[3]))
+
+
+# ----------------------------
 # Generate final answer using RAG
 # ----------------------------
 def ask(query, user_id):
@@ -184,37 +255,45 @@ def ask(query, user_id):
 
     # Use reranked chunks, or fall back to filtered if rejected
     if rejected or not reranked_chunks:
-        final_chunks = filtered_chunks[:RERANK_TOP_K]
+        reranked_final = filtered_chunks[:RERANK_TOP_K]
         rerank_status = "rejected (using vector similarity order)"
     else:
-        final_chunks = reranked_chunks
+        reranked_final = reranked_chunks
         rerank_status = "applied"
+
+    # 5. Expand context with adjacent chunks
+    t3 = time.time()
+    expanded_chunks = expand_context(reranked_final, user_id, radius=EXPAND_RADIUS)
+    print(f"Context expansion took: {time.time() - t3:.2f}s")
 
     print(f"\n--- Chunk Selection ---")
     print(f"Total corpus: {total_chunks} chunks")
     print(f"Vector search: {len(initial_chunks)} candidates")
     print(f"After similarity filter: {len(filtered_chunks)} chunks")
-    print(f"After reranking: {len(final_chunks)} chunks ({rerank_status})")
+    print(f"After reranking: {len(reranked_final)} chunks ({rerank_status})")
+    print(f"After expansion (radius={EXPAND_RADIUS}): {len(expanded_chunks)} chunks")
     if low_confidence:
         print("Low confidence match")
     print("------------------------")
 
-    # 5. Format context text and display retrieved chunks
+    # 6. Format context text and display retrieved chunks
     # Chunk tuple format: (chunk, header, source, chunk_index, similarity)
     context_text = ""
-    print("\n--- Retrieved Chunks (after reranking) ---")
-    for i, (chunk, header, source, chunk_index, sim) in enumerate(final_chunks):
+    print("\n--- Retrieved Chunks (after expansion) ---")
+    for i, (chunk, header, source, chunk_index, sim) in enumerate(expanded_chunks):
         # chunk_index is 0-based in DB, display as 1-based
         display_chunk_num = chunk_index + 1
+        # Mark context-only chunks (similarity=0.0) vs retrieved chunks
+        sim_display = f"similarity: {sim:.3f}" if sim > 0 else "context"
         if header:
-            print(f"[Chunk {display_chunk_num}] {header} (similarity: {sim:.3f})")
+            print(f"[Chunk {display_chunk_num}] {header} ({sim_display})")
             context_text += f"[Chunk {display_chunk_num}] {header} (source: {source})\n{chunk}\n\n"
         else:
-            print(f"[Chunk {display_chunk_num}] (similarity: {sim:.3f})")
+            print(f"[Chunk {display_chunk_num}] ({sim_display})")
             context_text += f"[Chunk {display_chunk_num}] (source: {source})\n{chunk}\n\n"
     print("------------------------\n")
 
-    # 6. Create RAG prompt (with low-confidence preamble if needed)
+    # 7. Create RAG prompt (with low-confidence preamble if needed)
     if low_confidence:
         preamble = """IMPORTANT: The retrieved context has low relevance to the user's question.
 Start your response with: "I couldn't find exactly what you were looking for, but here's something that might be relevant:"
@@ -237,13 +316,13 @@ Question: {query}
 When you reference information from the context, cite it using the chunk number shown (e.g., [Chunk 5], [Chunk 12]).
 """
 
-    # 7. Generate answer using OpenAI
-    t3 = time.time()
+    # 8. Generate answer using OpenAI
+    t4 = time.time()
     response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
-    print(f"LLM generation took: {time.time() - t3:.2f}s")
+    print(f"LLM generation took: {time.time() - t4:.2f}s")
 
     return response.choices[0].message.content
 
