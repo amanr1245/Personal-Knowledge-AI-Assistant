@@ -16,6 +16,7 @@ from typing import List, Tuple, Any
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from openai import OpenAI
+from retry_manager import with_retry
 
 load_dotenv()
 
@@ -142,7 +143,8 @@ def rerank_chunks(
     )
 
     try:
-        response = client.chat.completions.create(
+        response = with_retry(
+            client.chat.completions.create,
             model="gpt-4o-mini",
             messages=[
                 {

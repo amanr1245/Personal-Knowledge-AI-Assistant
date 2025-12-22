@@ -18,6 +18,7 @@ import fitz  # PyMuPDF
 import pdfplumber
 from openai import OpenAI
 import cache_manager
+from retry_manager import with_retry
 
 load_dotenv()
 
@@ -41,7 +42,8 @@ def _extract_text_with_vision(image_base64: str, prompt: str) -> str:
     Send an image to OpenAI Vision API and extract text.
     """
     try:
-        response = client.chat.completions.create(
+        response = with_retry(
+            client.chat.completions.create,
             model="gpt-4o",
             messages=[
                 {

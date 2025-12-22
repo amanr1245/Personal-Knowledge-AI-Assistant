@@ -5,6 +5,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import time
 from reranker import rerank_chunks, RERANK_CANDIDATES, RERANK_TOP_K
+from retry_manager import with_retry
 
 # ----------------------------
 # Load environment variables
@@ -61,7 +62,8 @@ def get_demo_user_id():
 # Embed the user query
 # ----------------------------
 def embed_query(query):
-    response = openai_client.embeddings.create(
+    response = with_retry(
+        openai_client.embeddings.create,
         model="text-embedding-3-small",
         input=query
     )
@@ -318,7 +320,8 @@ When you reference information from the context, cite it using the chunk number 
 
     # 8. Generate answer using OpenAI
     t4 = time.time()
-    response = openai_client.chat.completions.create(
+    response = with_retry(
+        openai_client.chat.completions.create,
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )

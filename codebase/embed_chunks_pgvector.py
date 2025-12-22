@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from chunk_pdf import chunk_pdf
 from semantic_chunker import chunk_semantically_from_pdf
 import cache_manager
+from retry_manager import with_retry
 import time
 
 # ----------------------------
@@ -93,7 +94,8 @@ def embed_batch(texts):
             batch = texts_to_embed[i:i+BATCH_SIZE]
             print(f"Embedding batch {i//BATCH_SIZE + 1}/{(len(texts_to_embed)-1)//BATCH_SIZE + 1} ({len(batch)} chunks)...")
 
-            response = openai_client.embeddings.create(
+            response = with_retry(
+                openai_client.embeddings.create,
                 model="text-embedding-3-small",
                 input=batch
             )
