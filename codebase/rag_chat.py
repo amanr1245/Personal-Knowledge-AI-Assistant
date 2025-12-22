@@ -94,7 +94,7 @@ def get_top_k(raw_query_embedding, user_id):
     # Filter by user_id to only search this user's chunks
     cur.execute(
         f"""
-        SELECT chunk, source, chunk_index, 1 - (embedding <=> %s) / 2 AS similarity
+        SELECT chunk, header, source, chunk_index, 1 - (embedding <=> %s) / 2 AS similarity
         FROM chunks
         WHERE user_id = %s
         ORDER BY embedding <=> %s
@@ -126,12 +126,14 @@ def filter_chunks(chunks):
     2. Drop-off detection (stop when similarity drops >10% between consecutive chunks)
 
     Returns: (filtered_chunks, low_confidence_flag)
+
+    Chunk tuple format: (chunk, header, source, chunk_index, similarity)
     """
     if not chunks:
         return [], True
 
     # Check if best chunk is below threshold
-    best_similarity = chunks[0][3]  # similarity is 4th element
+    best_similarity = chunks[0][4]  # similarity is 5th element (index 4)
     if best_similarity < MIN_SIMILARITY:
         # Return only the best chunk with low confidence flag
         return [chunks[0]], True
@@ -140,7 +142,7 @@ def filter_chunks(chunks):
     prev_similarity = best_similarity
 
     for chunk in chunks[1:]:
-        similarity = chunk[3]
+        similarity = chunk[4]
 
         # Stop if below minimum threshold
         if similarity < MIN_SIMILARITY:
@@ -182,13 +184,18 @@ def ask(query, user_id):
     print("------------------------")
 
     # 4. Format context text and display retrieved chunks
+    # Chunk tuple format: (chunk, header, source, chunk_index, similarity)
     context_text = ""
     print("\n--- Retrieved Chunks ---")
-    for i, (chunk, source, chunk_index, sim) in enumerate(filtered_chunks):
+    for i, (chunk, header, source, chunk_index, sim) in enumerate(filtered_chunks):
         # chunk_index is 0-based in DB, display as 1-based
         display_chunk_num = chunk_index + 1
-        print(f"[Chunk {display_chunk_num}] (similarity: {sim:.3f})")
-        context_text += f"[Chunk {display_chunk_num}] (source: {source})\n{chunk}\n\n"
+        if header:
+            print(f"[Chunk {display_chunk_num}] {header} (similarity: {sim:.3f})")
+            context_text += f"[Chunk {display_chunk_num}] {header} (source: {source})\n{chunk}\n\n"
+        else:
+            print(f"[Chunk {display_chunk_num}] (similarity: {sim:.3f})")
+            context_text += f"[Chunk {display_chunk_num}] (source: {source})\n{chunk}\n\n"
     print("------------------------\n")
 
     # 5. Create RAG prompt (with low-confidence preamble if needed)
