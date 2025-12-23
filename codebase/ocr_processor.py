@@ -6,7 +6,7 @@ Uses PyMuPDF (fitz) for PDF handling and OpenAI GPT-4 Vision for image-to-text.
 Strategies:
 - AUTO: Chooses STRICT or RELAXED based on word count per page
 - STRICT: Renders full page at 150 DPI, extracts text via Vision API
-- RELAXED: Uses pdfplumber text + extracts embedded images via Vision API
+- RELAXED: Uses PyMuPDF text + extracts embedded images via Vision API
 """
 
 import os
@@ -15,10 +15,10 @@ from enum import Enum
 from typing import List, Tuple
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
-import pdfplumber
 from openai import OpenAI
 import cache_manager
 from retry_manager import with_retry
+from pdf_extractor import extract_text_from_page
 
 load_dotenv()
 
@@ -127,20 +127,16 @@ def _process_page_strict(pdf_doc: fitz.Document, page_num: int) -> str:
     return text
 
 
-def _process_page_relaxed(pdf_path: str, pdf_doc: fitz.Document, page_num: int) -> str:
+def _process_page_relaxed(pdf_doc: fitz.Document, page_num: int) -> str:
     """
-    RELAXED mode: Keep pdfplumber text, extract embedded images via Vision API.
+    RELAXED mode: Keep PyMuPDF text, extract embedded images via Vision API.
     Image text is inserted as [image: extracted text here].
     """
-    # Extract text using pdfplumber
-    with pdfplumber.open(pdf_path) as pdf:
-        if page_num < len(pdf.pages):
-            page_text = pdf.pages[page_num].extract_text() or ""
-        else:
-            page_text = ""
+    # Extract text using PyMuPDF
+    page = pdf_doc[page_num]
+    page_text = extract_text_from_page(page)
 
     # Extract embedded images using PyMuPDF
-    page = pdf_doc[page_num]
     embedded_images = _extract_embedded_images(page)
 
     if not embedded_images:
@@ -210,16 +206,13 @@ def process_pdf_with_ocr(
             mode_used = "STRICT"
 
         elif strategy == OcrStrategy.RELAXED:
-            page_text = _process_page_relaxed(pdf_path, pdf_doc, page_num)
+            page_text = _process_page_relaxed(pdf_doc, page_num)
             mode_used = "RELAXED"
 
         else:  # AUTO strategy
-            # Get pdfplumber text to check word count
-            with pdfplumber.open(pdf_path) as pdf:
-                if page_num < len(pdf.pages):
-                    initial_text = pdf.pages[page_num].extract_text() or ""
-                else:
-                    initial_text = ""
+            # Get text using PyMuPDF to check word count
+            page = pdf_doc[page_num]
+            initial_text = extract_text_from_page(page)
 
             resolved_strategy = resolve_ocr_strategy(initial_text, threshold)
 
@@ -227,7 +220,7 @@ def process_pdf_with_ocr(
                 page_text = _process_page_strict(pdf_doc, page_num)
                 mode_used = "STRICT"
             else:
-                page_text = _process_page_relaxed(pdf_path, pdf_doc, page_num)
+                page_text = _process_page_relaxed(pdf_doc, page_num)
                 mode_used = "RELAXED"
 
         extracted_pages.append(page_text)
