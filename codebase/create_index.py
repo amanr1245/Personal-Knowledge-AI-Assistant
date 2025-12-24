@@ -52,7 +52,8 @@ cur.execute("""
         header TEXT,
         embedding vector(1536),
         source TEXT,
-        chunk_index INT
+        chunk_index INT,
+        file_type TEXT
     );
 """)
 conn.commit()
