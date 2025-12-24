@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from chunk_pdf import chunk_pdf
 from semantic_chunker import chunk_semantically_from_pdf, chunk_semantically
 from loaders import load_file, SUPPORTED_EXTENSIONS, is_supported
+from processors import EmbedProcessor
 import cache_manager
 from retry_manager import with_retry
 import time
@@ -23,6 +24,11 @@ openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 PDF_PATH = os.getenv("PDF_PATH")
 BATCH_SIZE = 2048  # OpenAI allows up to 2048 embeddings per request
+
+# Parallel embedding settings
+PARALLEL_EMBED = os.getenv("EMBED_PARALLEL", "true").lower() == "true"
+PARALLEL_WORKERS = int(os.getenv("EMBED_MAX_WORKERS", "8"))
+PARALLEL_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "100"))
 
 
 # ----------------------------
@@ -68,10 +74,42 @@ def get_or_create_demo_user():
 
 
 # ----------------------------
-# Batch embed using OpenAI API (with caching)
+# Batch embed using OpenAI API (with caching and parallel support)
 # ----------------------------
-def embed_batch(texts):
-    """Embed a batch of texts using OpenAI API with caching (max 2048 per call)"""
+def embed_batch(texts, parallel=None):
+    """
+    Embed a batch of texts using OpenAI API with caching.
+
+    Args:
+        texts: List of texts to embed
+        parallel: Use parallel processing (default from env EMBED_PARALLEL)
+
+    Returns:
+        List of embedding vectors
+    """
+    use_parallel = parallel if parallel is not None else PARALLEL_EMBED
+
+    if use_parallel:
+        return embed_batch_parallel(texts)
+    else:
+        return embed_batch_sequential(texts)
+
+
+def embed_batch_parallel(texts):
+    """Embed texts using parallel processing with EmbedProcessor."""
+    print(f"Embedding {len(texts)} texts in parallel...")
+
+    processor = EmbedProcessor(
+        max_workers=PARALLEL_WORKERS,
+        batch_size=PARALLEL_BATCH_SIZE
+    )
+
+    embeddings = processor.embed_batch_parallel(texts)
+    return embeddings
+
+
+def embed_batch_sequential(texts):
+    """Embed a batch of texts sequentially using OpenAI API with caching."""
     all_embeddings = []
     texts_to_embed = []
     text_indices = []  # Track which indices need embedding
