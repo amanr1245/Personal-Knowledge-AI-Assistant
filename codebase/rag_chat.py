@@ -4,6 +4,7 @@ from psycopg2 import pool
 from openai import OpenAI
 from dotenv import load_dotenv
 import time
+import threading
 from reranker import rerank_chunks, RERANK_CANDIDATES, RERANK_TOP_K
 from retry_manager import with_retry
 
@@ -15,24 +16,37 @@ load_dotenv()
 # ----------------------------
 # OpenAI client
 # ----------------------------
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Validate OPENAI_API_KEY is present
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    raise ValueError(
+        "OPENAI_API_KEY environment variable is required but not set. "
+        "Please set it in your .env file or environment."
+    )
+
+openai_client = OpenAI(api_key=openai_api_key)
 
 # ----------------------------
 # Database connection pool
 # ----------------------------
 connection_pool = None
+connection_pool_lock = threading.Lock()
 
 def get_connection_pool():
     global connection_pool
     if connection_pool is None:
-        connection_pool = psycopg2.pool.SimpleConnectionPool(
-            1, 10,  # min and max connections
-            dbname="personal_rag",
-            user="postgres",
-            password="postgres",
-            host="localhost",
-            port=5432
-        )
+        # Double-checked locking to prevent race condition
+        with connection_pool_lock:
+            # Re-check inside lock in case another thread created it
+            if connection_pool is None:
+                connection_pool = psycopg2.pool.SimpleConnectionPool(
+                    1, 10,  # min and max connections
+                    dbname=os.getenv("DB_NAME", "personal_rag"),
+                    user=os.getenv("DB_USER", "postgres"),
+                    password=os.getenv("DB_PASSWORD", "postgres"),
+                    host=os.getenv("DB_HOST", "localhost"),
+                    port=int(os.getenv("DB_PORT", "5432"))
+                )
     return connection_pool
 
 def connect_db():
@@ -45,17 +59,23 @@ def connect_db():
 # ----------------------------
 def get_demo_user_id():
     """Get the demo user's ID from the database."""
-    conn = connect_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE api_key = 'demo-api-key';")
-    result = cur.fetchone()
-    cur.close()
-    pool = get_connection_pool()
-    pool.putconn(conn)
+    conn = None
+    cur = None
+    try:
+        conn = connect_db()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE api_key = 'demo-api-key';")
+        result = cur.fetchone()
 
-    if result:
-        return result[0]
-    raise Exception("Demo user not found. Run create_index.py first.")
+        if result:
+            return result[0]
+        raise Exception("Demo user not found. Run create_index.py first.")
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            pool = get_connection_pool()
+            pool.putconn(conn)
 
 
 # ----------------------------
@@ -81,39 +101,45 @@ def get_top_k(raw_query_embedding, user_id):
     # Convert embedding to pgvector format: [0.12,0.53,...]
     emb_str = "[" + ",".join(str(x) for x in raw_query_embedding) + "]"
 
-    conn = connect_db()
-    cur = conn.cursor()
+    conn = None
+    cur = None
+    try:
+        conn = connect_db()
+        cur = conn.cursor()
 
-    # Get total chunk count for this user's corpus
-    cur.execute("SELECT COUNT(*) FROM chunks WHERE user_id = %s;", (user_id,))
-    total_chunks = cur.fetchone()[0]
+        # Get total chunk count for this user's corpus
+        cur.execute("SELECT COUNT(*) FROM chunks WHERE user_id = %s;", (user_id,))
+        total_chunks = cur.fetchone()[0]
 
-    # Cap at 25% of corpus or MAX_INITIAL, whichever is smaller
-    k = min(MAX_INITIAL, int(total_chunks * MAX_CORPUS_PCT))
-    k = max(k, 1)  # Always retrieve at least 1
+        # Cap at 50% of corpus or MAX_INITIAL, whichever is smaller
+        k = min(MAX_INITIAL, int(total_chunks * MAX_CORPUS_PCT))
+        k = max(k, 1)  # Always retrieve at least 1
 
-    # <=> operator = cosine distance (0 = identical, 2 = opposite)
-    # cosine similarity = 1 - (distance / 2) to get range [0, 1]
-    # Filter by user_id to only search this user's chunks
-    cur.execute(
-        f"""
-        SELECT chunk, header, source, chunk_index, 1 - (embedding <=> %s) / 2 AS similarity
-        FROM chunks
-        WHERE user_id = %s
-        ORDER BY embedding <=> %s
-        LIMIT {k};
-        """,
-        (emb_str, user_id, emb_str)
-    )
+        # Ensure k is a valid integer for parameterized query
+        k = int(k)
 
-    rows = cur.fetchall()
-    cur.close()
+        # <=> operator = cosine distance (0 = identical, 2 = opposite)
+        # cosine similarity = 1 - (distance / 2) to get range [0, 1]
+        # Filter by user_id to only search this user's chunks
+        cur.execute(
+            """
+            SELECT chunk, header, source, chunk_index, 1 - (embedding <=> %s) / 2 AS similarity
+            FROM chunks
+            WHERE user_id = %s
+            ORDER BY embedding <=> %s
+            LIMIT %s;
+            """,
+            (emb_str, user_id, emb_str, k)
+        )
 
-    # Return connection to pool
-    pool = get_connection_pool()
-    pool.putconn(conn)
-
-    return rows, total_chunks
+        rows = cur.fetchall()
+        return rows, total_chunks
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            pool = get_connection_pool()
+            pool.putconn(conn)
 
 
 # ----------------------------
@@ -195,42 +221,47 @@ def expand_context(chunks, user_id, radius=None):
     # Use dict to deduplicate by (source, chunk_index)
     expanded = {}
 
-    conn = connect_db()
-    cur = conn.cursor()
+    conn = None
+    cur = None
+    try:
+        conn = connect_db()
+        cur = conn.cursor()
 
-    for chunk_tuple in chunks:
-        # Chunk tuple: (chunk, header, source, chunk_index, similarity)
-        source = chunk_tuple[2]
-        chunk_index = chunk_tuple[3]
+        for chunk_tuple in chunks:
+            # Chunk tuple: (chunk, header, source, chunk_index, similarity)
+            source = chunk_tuple[2]
+            chunk_index = chunk_tuple[3]
 
-        # Fetch adjacent chunks within radius
-        cur.execute(
-            """
-            SELECT chunk, header, source, chunk_index, 0.0 AS similarity
-            FROM chunks
-            WHERE user_id = %s AND source = %s
-              AND chunk_index BETWEEN %s AND %s
-            ORDER BY chunk_index
-            """,
-            (user_id, source, chunk_index - radius, chunk_index + radius)
-        )
+            # Fetch adjacent chunks within radius
+            cur.execute(
+                """
+                SELECT chunk, header, source, chunk_index, 0.0 AS similarity
+                FROM chunks
+                WHERE user_id = %s AND source = %s
+                  AND chunk_index BETWEEN %s AND %s
+                ORDER BY chunk_index
+                """,
+                (user_id, source, chunk_index - radius, chunk_index + radius)
+            )
 
-        for row in cur.fetchall():
-            key = (row[2], row[3])  # (source, chunk_index)
-            if key not in expanded:
-                # Preserve original similarity if this was a retrieved chunk
-                original_sim = next(
-                    (c[4] for c in chunks if c[2] == row[2] and c[3] == row[3]),
-                    0.0  # Adjacent chunks get 0.0 similarity (context only)
-                )
-                expanded[key] = (row[0], row[1], row[2], row[3], original_sim)
+            for row in cur.fetchall():
+                key = (row[2], row[3])  # (source, chunk_index)
+                if key not in expanded:
+                    # Preserve original similarity if this was a retrieved chunk
+                    original_sim = next(
+                        (c[4] for c in chunks if c[2] == row[2] and c[3] == row[3]),
+                        0.0  # Adjacent chunks get 0.0 similarity (context only)
+                    )
+                    expanded[key] = (row[0], row[1], row[2], row[3], original_sim)
 
-    cur.close()
-    pool = get_connection_pool()
-    pool.putconn(conn)
-
-    # Sort by source, then chunk_index for coherent reading order
-    return sorted(expanded.values(), key=lambda c: (c[2], c[3]))
+        # Sort by source, then chunk_index for coherent reading order
+        return sorted(expanded.values(), key=lambda c: (c[2], c[3]))
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            pool = get_connection_pool()
+            pool.putconn(conn)
 
 
 # ----------------------------
@@ -339,8 +370,21 @@ if __name__ == "__main__":
     print(f"Using demo user (id={DEMO_USER_ID})")
     print("Type 'q' to exit.\n")
     while True:
-        q = input("Ask: ")
-        if q.lower() in ("q"):
-            print("Goodbye!")
+        try:
+            q = input("Ask: ")
+            if q.lower() in ("q"):
+                print("Goodbye!")
+                break
+
+            # Call ask() with error handling
+            try:
+                answer = ask(q, DEMO_USER_ID)
+                print("\n" + answer)
+            except Exception as e:
+                print(f"\nError processing query: {e}")
+                print("Please try again.\n")
+                continue
+
+        except (KeyboardInterrupt, EOFError):
+            print("\nGoodbye!")
             break
-        print("\n" + ask(q, DEMO_USER_ID))
